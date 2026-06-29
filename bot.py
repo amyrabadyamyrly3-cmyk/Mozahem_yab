@@ -35,12 +35,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data["users"][uid] = {"vip": False}
         save_data(data)
 
-    keyboard = [
-        ["🔎 جستجوی شماره", "👤 جستجوی نام"],
-        ["👤 حساب کاربری", "💎 درخواست VIP"],
-        ["🆘 پشتیبانی هوشمند"],
-        ["➕ پنل ادمین"]
-    ]
+   ‌keyboard = [
+    ["🔎 استعلام شماره هوشمند", "👤 جستجوی کاربران"],
+    ["👤 پروفایل من", "💎 عضویت VIP"],
+    ["🆘 پشتیبانی 24/7"],
+    ["➕ پنل مدیریت 👑"]
+]
 
     await update.message.reply_text(
         "🌟 به پنل حرفه‌ای مدیریت مشتری خوش آمدید\n\n"
