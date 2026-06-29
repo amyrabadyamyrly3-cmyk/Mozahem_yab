@@ -32,7 +32,7 @@ def init_db():
 def search_by_name(name):
     conn = sqlite3.connect("customers.db")
     c = conn.cursor()
-    c.execute("SELECT name, phone FROM customers WHERE name LIKE ?", (f"%{name}%",))
+    c.execute("SELECT name, phone FROM customers WHERE name = ?", (name,))
     results = c.fetchall()
     conn.close()
     return results
