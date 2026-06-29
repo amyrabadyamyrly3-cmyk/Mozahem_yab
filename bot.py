@@ -5,11 +5,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 
 # ================= CONFIG =================
 TOKEN = os.getenv("BOT_TOKEN")
-
-# 👑 چند ادمین (از Railway میاد)
-ADMIN_IDS = os.getenv("ADMIN_ID", "0").split(",")
-
-ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS if x.strip().isdigit()]
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 DATA_FILE = "data.json"
 
@@ -31,12 +27,7 @@ def save_data(data):
 data = load_data()
 
 
-# ================= CHECK ADMIN =================
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
-
-
-# ================= START =================
+# ================= START MENU =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
 
@@ -45,71 +36,121 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data(data)
 
     keyboard = [
-        ["🔍 جستجو شماره", "👤 جستجو اسم"],
-        ["👤 حساب کاربری", "💎 VIP"],
-        ["🆘 پشتیبانی"],
-        ["➕ افزودن مشتری"]
+        ["🔎 جستجوی شماره", "👤 جستجوی نام"],
+        ["👤 حساب کاربری", "💎 درخواست VIP"],
+        ["🆘 پشتیبانی هوشمند"],
+        ["➕ پنل ادمین"]
     ]
 
     await update.message.reply_text(
-        "👋 خوش آمدید",
+        "🌟 به پنل حرفه‌ای مدیریت مشتری خوش آمدید\n\n"
+        "🔹 یک گزینه انتخاب کنید:",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
 
 
-# ================= MAIN =================
+# ================= MAIN HANDLER =================
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     uid = update.effective_user.id
     mode = context.user_data.get("mode")
 
-    # ===== ADD CUSTOMER =====
-    if text == "➕ افزودن مشتری":
-        if not is_admin(uid):
-            await update.message.reply_text("❌ فقط ادمین")
+    # ================= ADMIN PANEL =================
+    if text == "➕ پنل ادمین":
+        if uid != ADMIN_ID:
+            await update.message.reply_text("⛔ فقط ادمین")
             return
 
-        context.user_data["mode"] = "add"
-        await update.message.reply_text("نام|شماره")
+        keyboard = [
+            ["➕ افزودن تکی"],
+            ["📋 افزودن چندتایی"],
+            ["📊 لیست مشتری‌ها"]
+        ]
+
+        await update.message.reply_text(
+            "👑 پنل ادمین فعال شد",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        )
         return
 
-    # ===== SEARCH PHONE =====
-    if text == "🔍 جستجو شماره":
+    # ================= ADD SINGLE =================
+    if text == "➕ افزودن تکی":
+        if uid != ADMIN_ID:
+            return
+
+        context.user_data["mode"] = "add_single"
+        await update.message.reply_text("نام|شماره را وارد کن")
+        return
+
+    # ================= ADD BULK =================
+    if text == "📋 افزودن چندتایی":
+        if uid != ADMIN_ID:
+            return
+
+        context.user_data["mode"] = "add_bulk"
+        await update.message.reply_text(
+            "📋 چندتایی اضافه کن\n\n"
+            "هر خط:\n"
+            "نام|شماره\n\n"
+            "مثال:\n"
+            "علی|0912\nرضا|0935"
+        )
+        return
+
+    # ================= LIST CUSTOMERS =================
+    if text == "📊 لیست مشتری‌ها":
+        if uid != ADMIN_ID:
+            return
+
+        if not data["customers"]:
+            await update.message.reply_text("خالیه")
+            return
+
+        msg = "📊 لیست مشتری‌ها:\n\n"
+        for c in data["customers"].values():
+            msg += f"{c['name']} - {c['phone']}\n"
+
+        await update.message.reply_text(msg)
+        return
+
+    # ================= SEARCH PHONE =================
+    if text == "🔎 جستجوی شماره":
         context.user_data["mode"] = "phone"
         await update.message.reply_text("شماره را وارد کن")
         return
 
-    # ===== SEARCH NAME =====
-    if text == "👤 جستجو اسم":
+    # ================= SEARCH NAME =================
+    if text == "👤 جستجوی نام":
         context.user_data["mode"] = "name"
-        await update.message.reply_text("اسم را وارد کن")
+        await update.message.reply_text("نام را وارد کن")
         return
 
-    # ===== VIP =====
-    if text == "💎 VIP":
-        for admin in ADMIN_IDS:
-            await context.bot.send_message(admin, f"💎 VIP request: {uid}")
+    # ================= VIP =================
+    if text == "💎 درخواست VIP":
+        await context.bot.send_message(
+            ADMIN_ID,
+            f"💎 درخواست VIP\n👤 {uid}"
+        )
         await update.message.reply_text("ارسال شد")
         return
 
-    # ===== ACCOUNT =====
+    # ================= ACCOUNT =================
     if text == "👤 حساب کاربری":
         user = data["users"].get(str(uid), {})
         await update.message.reply_text(
-            f"ID: {uid}\nVIP: {user.get('vip', False)}"
+            f"👤 حساب شما\n\nID: {uid}\nVIP: {user.get('vip', False)}"
         )
         return
 
-    # ===== SUPPORT =====
-    if text == "🆘 پشتیبانی":
+    # ================= SUPPORT =================
+    if text == "🆘 پشتیبانی هوشمند":
         context.user_data["mode"] = "support"
         await update.message.reply_text("پیام خود را بنویس")
         return
 
-    # ===== ADD CUSTOMER SAVE =====
-    if mode == "add":
-        if not is_admin(uid):
-            await update.message.reply_text("❌ اجازه نداری")
+    # ================= ADD SINGLE SAVE =================
+    if mode == "add_single":
+        if uid != ADMIN_ID:
             return
 
         try:
@@ -127,7 +168,29 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("فرمت: نام|شماره")
         return
 
-    # ===== SEARCH PHONE =====
+    # ================= BULK ADD =================
+    if mode == "add_bulk":
+        if uid != ADMIN_ID:
+            return
+
+        lines = text.split("\n")
+        for line in lines:
+            try:
+                name, phone = line.split("|")
+                cid = str(len(data["customers"]) + 1)
+
+                data["customers"][cid] = {
+                    "name": name.strip(),
+                    "phone": phone.strip()
+                }
+            except:
+                continue
+
+        save_data(data)
+        await update.message.reply_text("✅ همه اضافه شدند")
+        return
+
+    # ================= SEARCH PHONE =================
     if mode == "phone":
         for c in data["customers"].values():
             if c["phone"] == text:
@@ -136,7 +199,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("پیدا نشد")
         return
 
-    # ===== SEARCH NAME =====
+    # ================= SEARCH NAME =================
     if mode == "name":
         for c in data["customers"].values():
             if text in c["name"]:
@@ -145,11 +208,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("پیدا نشد")
         return
 
-    # ===== SUPPORT =====
+    # ================= SUPPORT =================
     if mode == "support":
         await context.bot.send_message(
-            ADMIN_IDS[0],
-            f"🆘 {uid}\n{text}"
+            ADMIN_ID,
+            f"🆘 پیام:\n{uid}\n{text}"
         )
         await update.message.reply_text("ارسال شد")
         return
