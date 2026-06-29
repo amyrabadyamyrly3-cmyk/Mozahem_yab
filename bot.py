@@ -104,7 +104,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ===== جستجو با شماره =====
-    if text == "📞 جستجو با شماره":
+    
+# ===== جستجو با اسم =====
+if text == "🔍 جستجو با اسم":
+    context.user_data["mode"] = "search_name"
+    await update.message.reply_text("✏️ لطفاً اسم مشتری را بنویسید:")
+    return
+
+# ===== جستجو با شماره =====
+if text == "📞 جستجو با شماره":
     context.user_data["mode"] = "search_phone"
     await update.message.reply_text(
         "📞 جستجو با شماره\n\n"
@@ -117,7 +125,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "+98 912 345 6789"
     )
     return
-
     # ===== افزودن مشتری (فقط ادمین) =====
     if text == "➕ افزودن مشتری":
         if not is_admin:
