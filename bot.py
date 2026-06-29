@@ -105,9 +105,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== جستجو با شماره =====
     if text == "📞 جستجو با شماره":
-        context.user_data["mode"] = "search_phone"
-        await update.message.reply_text("✏️ لطفاً شماره تلفن را بنویسید:")
-        return
+    context.user_data["mode"] = "search_phone"
+    await update.message.reply_text(
+        "📞 جستجو با شماره\n\n"
+        "لطفاً شماره را به صورت کامل وارد کنید\n\n"
+        "❗ مثال درست:\n"
+        "09123456789\n\n"
+        "❌ مثال اشتباه:\n"
+        "9123456789\n"
+        "09\n"
+        "+98 912 345 6789"
+    )
+    return
 
     # ===== افزودن مشتری (فقط ادمین) =====
     if text == "➕ افزودن مشتری":
