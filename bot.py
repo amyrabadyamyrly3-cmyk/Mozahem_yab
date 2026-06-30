@@ -1,8 +1,7 @@
 import os
 import re
 import json
-import random
-import string
+import time
 from datetime import datetime, timedelta
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
@@ -17,7 +16,10 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATA_FILE = "data.json"
 
 PHONE_RE = re.compile(r"^09\d{9}$")
-BIRTHDAY_RE = re.compile(r"^\d{2}-\d{2}$")  # MM-DD
+BIRTHDAY_RE = re.compile(r"^\d{2}-\d{2}$")
+URL_RE = re.compile(r"https?://\S+")
+
+SPAM_COOLDOWN = 1.2  # seconds
 
 
 # ================= DATA =================
@@ -27,10 +29,19 @@ def load_data():
             d = json.load(f)
     except Exception:
         d = {}
-    d.setdefault("customers", {})   # cid -> {name, phone}
-    d.setdefault("users", {})       # uid(str) -> {points, vip, ref_code, referred_by,
-                                     #              name, phone, birthday, last_active}
-    d.setdefault("relay", {})       # sent_message_id(str) -> user_id(int)
+    d.setdefault("customers", {})
+    d.setdefault("users", {})
+    d.setdefault("relay", {})       # msg_id(str) -> {user_id, ticket_id}
+    d.setdefault("tickets", {})     # ticket_id(str) -> {user_id, type, text, status, answer, created}
+    d.setdefault("ticket_counter", 1000)
+    d.setdefault("quick_replies", [])
+    d.setdefault("settings", {})
+    s = d["settings"]
+    s.setdefault("vip_message", "💎 برای خرید حساب VIP و اطلاعات بیشتر، لطفاً منتظر بمانید، به‌زودی ادمین با شما در تماس خواهد بود.")
+    s.setdefault("support_prompt", "🆘 پیام خود را برای پشتیبانی بنویسید:")
+    s.setdefault("buy_prompt", "🛒 درخواست خرید خود را بنویسید:")
+    s.setdefault("maintenance", False)
+    s.setdefault("maintenance_message", "🌙 ربات موقتاً در دسترس نیست. لطفاً بعداً مراجعه کنید.")
     return d
 
 
@@ -40,6 +51,7 @@ def save_data(d):
 
 
 data = load_data()
+spam_guard = {}
 
 
 def now_str():
@@ -52,7 +64,6 @@ def get_user(uid):
         data["users"][uid] = {
             "points": 0,
             "vip": False,
-            "ref_code": uid,
             "referred_by": None,
             "name": None,
             "phone": None,
@@ -69,13 +80,29 @@ def touch_user(uid):
     save_data(data)
 
 
+def new_ticket(uid, kind, text):
+    data["ticket_counter"] += 1
+    tid = str(data["ticket_counter"])
+    data["tickets"][tid] = {
+        "user_id": uid,
+        "type": kind,
+        "text": text,
+        "status": "open",
+        "answer": None,
+        "created": now_str(),
+    }
+    save_data(data)
+    return tid
+
+
 # ================= KEYBOARDS =================
 def main_keyboard():
     return ReplyKeyboardMarkup([
         ["🔍 جستجو با شماره", "👤 جستجو با نام"],
         ["🛒 ثبت درخواست خرید", "🆘 پشتیبانی"],
         ["💳 حساب من", "🎁 دعوت از دوستان"],
-        ["📦 بمبر"],
+        ["💎 خرید VIP", "📦 بمبر"],
+        ["📥 دانلود از شبکه‌های اجتماعی", "🔎 پیگیری درخواست"],
     ], resize_keyboard=True)
 
 
@@ -90,6 +117,16 @@ def admin_keyboard():
         ["📊 آمار فروش", "📤 خروجی لیست"],
         ["👥 کاربران ربات", "🎂 تغییر تاریخ تولد"],
         ["💬 پیام به کاربر خاص", "📢 پیام همگانی"],
+        ["✏️ ویرایش پیام‌ها", "💬 پاسخ‌های آماده"],
+        ["📨 پیام‌های نخوانده", "🌙 فعال/غیرفعال ربات"],
+        ["🔙 خروج به منو"],
+    ], resize_keyboard=True)
+
+
+def edit_prompt_keyboard():
+    return ReplyKeyboardMarkup([
+        ["💎 متن VIP", "🆘 متن پشتیبانی"],
+        ["🛒 متن خرید"],
         ["🔙 خروج به منو"],
     ], resize_keyboard=True)
 
@@ -112,10 +149,9 @@ async def notify_admin(context, text):
 
 async def notify_admin_search(context, user, kind, query, found):
     name = user.first_name or "بدون نام"
-    uid = user.id
     msg = (
         f"🔔 جستجوی جدید\n\n"
-        f"👤 کاربر: {name} (آیدی: {uid})\n"
+        f"👤 کاربر: {name} (آیدی: {user.id})\n"
         f"🔍 نوع: {kind}\n"
         f"📝 متن: {query}\n"
         f"✅ نتیجه: {'پیدا شد' if found else 'پیدا نشد'}\n"
@@ -129,32 +165,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     u = get_user(uid)
     touch_user(uid)
+    clear_mode(context)
 
-    # referral handling: /start <referrer_uid>
     if context.args:
         ref_code = context.args[0]
-        if ref_code != str(uid) and u["referred_by"] is None:
-            if ref_code in data["users"]:
-                u["referred_by"] = ref_code
-                u["points"] += 20
-                data["users"][ref_code]["points"] += 20
-                save_data(data)
-                await context.bot.send_message(
-                    int(ref_code),
-                    "🎁 یک دوست با کد دعوت شما عضو شد! ۲۰ امتیاز گرفتید."
-                )
+        if ref_code != str(uid) and u["referred_by"] is None and ref_code in data["users"]:
+            u["referred_by"] = ref_code
+            u["points"] += 20
+            data["users"][ref_code]["points"] += 20
+            save_data(data)
+            try:
+                await context.bot.send_message(int(ref_code), "🎁 یک دوست با کد دعوت شما عضو شد! ۲۰ امتیاز گرفتید.")
+            except Exception:
+                pass
 
-    clear_mode(context)
     name = update.effective_user.first_name or ""
     await update.message.reply_text(
-        f"👋 سلام {name} عزیز!\n\n"
-        f"🌟 به ربات شاپ ما خوش آمدید\n"
-        f"🔹 یک گزینه را انتخاب کنید:",
+        f"👋 سلام {name} عزیز!\n\n🌟 به ربات شاپ ما خوش آمدید\n🔹 یک گزینه را انتخاب کنید:",
         reply_markup=main_keyboard()
     )
 
 
-# ================= ADMIN ENTRY (command only) =================
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -164,18 +195,45 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= MAIN HANDLER =================
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    text = update.message.text or ""
     uid = update.effective_user.id
     user_obj = update.effective_user
+    admin = is_admin(uid)
+
+    # ---- anti-spam (non-admin only) ----
+    if not admin:
+        last = spam_guard.get(uid, 0)
+        now_ts = time.time()
+        if now_ts - last < SPAM_COOLDOWN:
+            return
+        spam_guard[uid] = now_ts
+
     touch_user(uid)
 
-    # ---- Admin relay: reply to a forwarded message ----
-    if is_admin(uid) and update.message.reply_to_message:
+    # ---- Admin reply to relayed ticket message ----
+    if admin and update.message.reply_to_message:
         rid = str(update.message.reply_to_message.message_id)
         if rid in data["relay"]:
-            target = data["relay"][rid]
+            info = data["relay"][rid]
+            target = info["user_id"]
+            tid = info.get("ticket_id")
+            reply_text = text
+            if text.startswith("#"):
+                try:
+                    idx = int(text[1:]) - 1
+                    reply_text = data["quick_replies"][idx]
+                except Exception:
+                    await update.message.reply_text("❌ شماره پاسخ آماده نامعتبر است.")
+                    return
             try:
-                await context.bot.send_message(target, f"💬 پاسخ ادمین:\n\n{text}")
+                prefix = f"💬 پاسخ ادمین"
+                if tid:
+                    prefix += f" (پیگیری #{tid})"
+                await context.bot.send_message(target, f"{prefix}:\n\n{reply_text}")
+                if tid and tid in data["tickets"]:
+                    data["tickets"][tid]["status"] = "answered"
+                    data["tickets"][tid]["answer"] = reply_text
+                    save_data(data)
                 await update.message.reply_text("✅ پیام ارسال شد.")
             except Exception:
                 await update.message.reply_text("❌ ارسال نشد.")
@@ -186,10 +244,15 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---- universal exit ----
     if text == "🔙 خروج به منو":
         clear_mode(context)
-        if is_admin(uid):
+        if admin:
             await update.message.reply_text("بازگشت به پنل مدیریت", reply_markup=admin_keyboard())
         else:
             await update.message.reply_text("بازگشت به منوی اصلی", reply_markup=main_keyboard())
+        return
+
+    # ---- maintenance mode block (customers only) ----
+    if not admin and data["settings"]["maintenance"] and text != "/start":
+        await update.message.reply_text(data["settings"]["maintenance_message"])
         return
 
     # ============ CUSTOMER MENU BUTTONS ============
@@ -205,22 +268,23 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "🛒 ثبت درخواست خرید":
         context.user_data["mode"] = "buy_request"
-        await update.message.reply_text("🛒 درخواست خرید خود را بنویسید:", reply_markup=exit_keyboard())
+        await update.message.reply_text(data["settings"]["buy_prompt"], reply_markup=exit_keyboard())
         return
 
     if text == "🆘 پشتیبانی":
         context.user_data["mode"] = "support"
-        await update.message.reply_text("🆘 پیام خود را برای پشتیبانی بنویسید:", reply_markup=exit_keyboard())
+        await update.message.reply_text(data["settings"]["support_prompt"], reply_markup=exit_keyboard())
         return
 
     if text == "💳 حساب من":
         u = get_user(uid)
         bday = u["birthday"] or "ثبت نشده"
+        vip_line = "بله ✅" if u["vip"] else "خیر"
         await update.message.reply_text(
             f"💳 حساب کاربری شما\n\n"
             f"🆔 آیدی: {uid}\n"
             f"⭐ امتیاز: {u['points']}\n"
-            f"👑 وضعیت VIP: {'بله ✅' if u['vip'] else 'خیر'}\n"
+            f"👑 وضعیت VIP: {vip_line}\n"
             f"🎂 تاریخ تولد: {bday}\n\n"
             f"برای ثبت/تغییر تاریخ تولد (فرمت ماه-روز مثل 07-25) همینجا بفرستید:"
         )
@@ -231,23 +295,39 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_username = (await context.bot.get_me()).username
         link = f"https://t.me/{bot_username}?start={uid}"
         await update.message.reply_text(
-            "🎁 دوستان خود را دعوت کنید!\n\n"
-            f"🔗 لینک دعوت شما:\n{link}\n\n"
+            f"🎁 دوستان خود را دعوت کنید!\n\n🔗 لینک دعوت شما:\n{link}\n\n"
             "✨ با هر دعوت موفق، شما و دوستتان هر دو ۲۰ امتیاز می‌گیرید."
         )
+        return
+
+    if text == "💎 خرید VIP":
+        await update.message.reply_text(data["settings"]["vip_message"])
+        await notify_admin(context, f"💎 درخواست VIP\n👤 {user_obj.first_name} (آیدی: {uid})")
         return
 
     if text == "📦 بمبر":
         context.user_data["mode"] = "bomber_phone"
         await update.message.reply_text(
-            "📦 شماره تلفن خود را وارد کنید\n\n"
-            "فرمت صحیح: 09127654123",
+            "📦 شماره تلفن خود را وارد کنید\n\nفرمت صحیح: 09127654123",
             reply_markup=exit_keyboard()
         )
         return
 
+    if text == "📥 دانلود از شبکه‌های اجتماعی":
+        context.user_data["mode"] = "social_dl"
+        await update.message.reply_text(
+            "📥 لینک پست/ویدیو (اینستاگرام، یوتیوب و...) را بفرستید:",
+            reply_markup=exit_keyboard()
+        )
+        return
+
+    if text == "🔎 پیگیری درخواست":
+        context.user_data["mode"] = "track_ticket"
+        await update.message.reply_text("🔎 شماره پیگیری خود را وارد کنید (مثل 1024):", reply_markup=exit_keyboard())
+        return
+
     # ============ ADMIN MENU BUTTONS ============
-    if is_admin(uid):
+    if admin:
         if text == "➕ افزودن مشتری تکی":
             context.user_data["mode"] = "admin_add_name"
             await update.message.reply_text("👤 نام و فامیل مشتری جدید را بنویسید:", reply_markup=exit_keyboard())
@@ -256,27 +336,26 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "📋 افزودن مشتری گروهی":
             context.user_data["mode"] = "admin_add_bulk"
             await update.message.reply_text(
-                "📋 هر خط را به شکل زیر بنویسید:\nنام|شماره\n\nمثال:\nعلی رضایی|09120000000\nسارا احمدی|09130000000",
+                "📋 هر خط: نام|شماره\n\nمثال:\nعلی رضایی|09120000000",
                 reply_markup=exit_keyboard()
             )
             return
 
         if text == "✏️ ویرایش مشتری":
             context.user_data["mode"] = "admin_edit_find"
-            await update.message.reply_text("📞 شماره مشتری که می‌خواهید ویرایش کنید را بفرستید:", reply_markup=exit_keyboard())
+            await update.message.reply_text("📞 شماره مشتری برای ویرایش را بفرستید:", reply_markup=exit_keyboard())
             return
 
         if text == "🗑 حذف مشتری":
             context.user_data["mode"] = "admin_delete"
-            await update.message.reply_text("📞 شماره مشتری که می‌خواهید حذف کنید را بفرستید:", reply_markup=exit_keyboard())
+            await update.message.reply_text("📞 شماره مشتری برای حذف را بفرستید:", reply_markup=exit_keyboard())
             return
 
         if text == "📊 آمار فروش":
-            customers = data["customers"]
-            total = len(customers)
             await update.message.reply_text(
-                f"📊 آمار فروش\n\n👥 تعداد کل مشتریان: {total}\n"
-                f"👤 تعداد کاربران ربات: {len(data['users'])}"
+                f"📊 آمار فروش\n\n👥 تعداد کل مشتریان: {len(data['customers'])}\n"
+                f"👤 تعداد کاربران ربات: {len(data['users'])}\n"
+                f"📨 تیکت‌های باز: {sum(1 for t in data['tickets'].values() if t['status']=='open')}"
             )
             return
 
@@ -285,8 +364,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not customers:
                 await update.message.reply_text("📭 لیست خالی است.")
                 return
-            lines = [f"{c['name']} - {c['phone']}" for c in customers.values()]
-            content = "\n".join(lines)
+            content = "\n".join(f"{c['name']} - {c['phone']}" for c in customers.values())
             with open("export.txt", "w", encoding="utf-8") as f:
                 f.write(content)
             await update.message.reply_document(document=open("export.txt", "rb"), filename="مشتریان.txt")
@@ -320,15 +398,73 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("📢 متن پیام همگانی را بنویسید:", reply_markup=exit_keyboard())
             return
 
-    # ============ MODE PROCESSING ============
+        if text == "✏️ ویرایش پیام‌ها":
+            await update.message.reply_text("کدام پیام را می‌خواهید ویرایش کنید؟", reply_markup=edit_prompt_keyboard())
+            return
 
+        if text == "💎 متن VIP":
+            context.user_data["mode"] = "admin_edit_vip_text"
+            await update.message.reply_text(
+                f"متن فعلی:\n\n{data['settings']['vip_message']}\n\nمتن جدید را بفرستید:",
+                reply_markup=exit_keyboard()
+            )
+            return
+
+        if text == "🆘 متن پشتیبانی":
+            context.user_data["mode"] = "admin_edit_support_text"
+            await update.message.reply_text(
+                f"متن فعلی:\n\n{data['settings']['support_prompt']}\n\nمتن جدید را بفرستید:",
+                reply_markup=exit_keyboard()
+            )
+            return
+
+        if text == "🛒 متن خرید":
+            context.user_data["mode"] = "admin_edit_buy_text"
+            await update.message.reply_text(
+                f"متن فعلی:\n\n{data['settings']['buy_prompt']}\n\nمتن جدید را بفرستید:",
+                reply_markup=exit_keyboard()
+            )
+            return
+
+        if text == "💬 پاسخ‌های آماده":
+            qrs = data["quick_replies"]
+            msg = "💬 پاسخ‌های آماده:\n\n"
+            if qrs:
+                for i, q in enumerate(qrs, 1):
+                    msg += f"{i}. {q}\n"
+            else:
+                msg += "هیچ پاسخی ثبت نشده.\n"
+            msg += (
+                "\n➕ برای افزودن: متن را با پیشوند + بفرستید (مثال: +موجود نیست)\n"
+                "🗑 برای حذف: شماره را با پیشوند - بفرستید (مثال: -2)\n"
+                "ℹ️ برای استفاده هنگام پاسخ به مشتری، کافیست #شماره را Reply کنید (مثال: #1)"
+            )
+            context.user_data["mode"] = "admin_quick_manage"
+            await update.message.reply_text(msg[:4000], reply_markup=exit_keyboard())
+            return
+
+        if text == "📨 پیام‌های نخوانده":
+            open_tickets = {tid: t for tid, t in data["tickets"].items() if t["status"] == "open"}
+            if not open_tickets:
+                await update.message.reply_text("✅ همه پیام‌ها پاسخ داده شده‌اند.")
+                return
+            msg = "📨 پیام‌های نخوانده:\n\n"
+            for tid, t in open_tickets.items():
+                msg += f"#{tid} | {t['type']} | {t['text'][:40]}\n"
+            await update.message.reply_text(msg[:4000])
+            return
+
+        if text == "🌙 فعال/غیرفعال ربات":
+            data["settings"]["maintenance"] = not data["settings"]["maintenance"]
+            save_data(data)
+            state = "غیرفعال 🌙" if data["settings"]["maintenance"] else "فعال ✅"
+            await update.message.reply_text(f"وضعیت ربات: {state}", reply_markup=admin_keyboard())
+            return
+
+    # ============ MODE PROCESSING (CUSTOMER) ============
     if mode == "search_phone":
         clear_mode(context)
-        found_c = None
-        for c in data["customers"].values():
-            if c["phone"] == text:
-                found_c = c
-                break
+        found_c = next((c for c in data["customers"].values() if c["phone"] == text), None)
         await notify_admin_search(context, user_obj, "شماره", text, bool(found_c))
         if found_c:
             await update.message.reply_text(f"✅ {found_c['name']} - {found_c['phone']}", reply_markup=main_keyboard())
@@ -338,11 +474,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if mode == "search_name":
         clear_mode(context)
-        found_c = None
-        for c in data["customers"].values():
-            if c["name"] == text:
-                found_c = c
-                break
+        found_c = next((c for c in data["customers"].values() if c["name"] == text), None)
         await notify_admin_search(context, user_obj, "نام", text, bool(found_c))
         if found_c:
             await update.message.reply_text(f"✅ {found_c['name']} - {found_c['phone']}", reply_markup=main_keyboard())
@@ -352,24 +484,24 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if mode == "buy_request":
         clear_mode(context)
+        tid = new_ticket(uid, "خرید", text)
         sent = await context.bot.send_message(
-            ADMIN_ID,
-            f"🛒 درخواست خرید جدید\n👤 {user_obj.first_name} (آیدی: {uid})\n\n📝 {text}"
+            ADMIN_ID, f"🛒 درخواست خرید جدید (پیگیری #{tid})\n👤 {user_obj.first_name} (آیدی: {uid})\n\n📝 {text}"
         )
-        data["relay"][str(sent.message_id)] = uid
+        data["relay"][str(sent.message_id)] = {"user_id": uid, "ticket_id": tid}
         save_data(data)
-        await update.message.reply_text("✅ درخواست شما ارسال شد. به‌زودی پاسخ می‌گیرید.", reply_markup=main_keyboard())
+        await update.message.reply_text(f"✅ درخواست شما ثبت شد.\n🔎 شماره پیگیری: {tid}", reply_markup=main_keyboard())
         return
 
     if mode == "support":
         clear_mode(context)
+        tid = new_ticket(uid, "پشتیبانی", text)
         sent = await context.bot.send_message(
-            ADMIN_ID,
-            f"🆘 پیام پشتیبانی\n👤 {user_obj.first_name} (آیدی: {uid})\n\n📝 {text}"
+            ADMIN_ID, f"🆘 پیام پشتیبانی (پیگیری #{tid})\n👤 {user_obj.first_name} (آیدی: {uid})\n\n📝 {text}"
         )
-        data["relay"][str(sent.message_id)] = uid
+        data["relay"][str(sent.message_id)] = {"user_id": uid, "ticket_id": tid}
         save_data(data)
-        await update.message.reply_text("✅ پیام شما ارسال شد.", reply_markup=main_keyboard())
+        await update.message.reply_text(f"✅ پیام شما ثبت شد.\n🔎 شماره پیگیری: {tid}", reply_markup=main_keyboard())
         return
 
     if mode == "set_birthday":
@@ -390,14 +522,51 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await notify_admin(context, f"📦 بمبر - شماره جدید\n👤 {user_obj.first_name} (آیدی: {uid})\n📞 {text}")
             await update.message.reply_text("✅ شماره شما با موفقیت ارسال شد.", reply_markup=main_keyboard())
         else:
-            await update.message.reply_text(
-                "❌ شماره وارد شده اشتباه است.\nفرمت صحیح: 09127654123",
-                reply_markup=exit_keyboard()
-            )
+            await update.message.reply_text("❌ شماره وارد شده اشتباه است.\nفرمت صحیح: 09127654123", reply_markup=exit_keyboard())
+        return
+
+    if mode == "track_ticket":
+        clear_mode(context)
+        t = data["tickets"].get(text)
+        if not t or t["user_id"] != uid:
+            await update.message.reply_text("❌ تیکتی با این شماره برای شما پیدا نشد.", reply_markup=main_keyboard())
+        elif t["status"] == "answered":
+            await update.message.reply_text(f"✅ پاسخ داده شده:\n\n{t['answer']}", reply_markup=main_keyboard())
+        else:
+            await update.message.reply_text("⏳ هنوز پاسخ داده نشده. لطفاً صبر کنید.", reply_markup=main_keyboard())
+        return
+
+    if mode == "social_dl":
+        clear_mode(context)
+        if not URL_RE.search(text):
+            await update.message.reply_text("❌ لینک معتبر نیست.", reply_markup=main_keyboard())
+            return
+        await update.message.reply_text("⏳ در حال دانلود... کمی صبر کنید.")
+        try:
+            import yt_dlp
+            url = URL_RE.search(text).group(0)
+            outtmpl = f"dl_{uid}_{int(time.time())}.%(ext)s"
+            ydl_opts = {
+                "outtmpl": outtmpl,
+                "format": "best[filesize<50M]/best",
+                "quiet": True,
+                "noplaylist": True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+            await update.message.reply_document(document=open(filename, "rb"))
+            try:
+                os.remove(filename)
+            except Exception:
+                pass
+        except Exception:
+            await update.message.reply_text("❌ دانلود ناموفق بود. لینک را بررسی کنید یا بعداً تلاش کنید.")
+        await update.message.reply_text("منوی اصلی:", reply_markup=main_keyboard())
         return
 
     # ============ ADMIN MODE PROCESSING ============
-    if is_admin(uid):
+    if admin:
         if mode == "admin_add_name":
             context.user_data["new_name"] = text
             context.user_data["mode"] = "admin_add_phone"
@@ -427,11 +596,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if mode == "admin_edit_find":
-            target_cid = None
-            for cid, c in data["customers"].items():
-                if c["phone"] == text:
-                    target_cid = cid
-                    break
+            target_cid = next((cid for cid, c in data["customers"].items() if c["phone"] == text), None)
             if target_cid:
                 context.user_data["edit_cid"] = target_cid
                 context.user_data["mode"] = "admin_edit_name"
@@ -460,11 +625,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if mode == "admin_delete":
             clear_mode(context)
-            target_cid = None
-            for cid, c in data["customers"].items():
-                if c["phone"] == text:
-                    target_cid = cid
-                    break
+            target_cid = next((cid for cid, c in data["customers"].items() if c["phone"] == text), None)
             if target_cid:
                 del data["customers"][target_cid]
                 save_data(data)
@@ -479,7 +640,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["mode"] = "admin_set_user_name_value"
                 await update.message.reply_text("👤 نام و فامیل را بفرستید:", reply_markup=exit_keyboard())
             else:
-                await update.message.reply_text("❌ این آیدی در لیست کاربران نیست.", reply_markup=admin_keyboard())
+                await update.message.reply_text("❌ این آیدی پیدا نشد.", reply_markup=admin_keyboard())
                 clear_mode(context)
             return
 
@@ -541,34 +702,64 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ پیام به {count} کاربر ارسال شد.", reply_markup=admin_keyboard())
             return
 
+        if mode == "admin_edit_vip_text":
+            clear_mode(context)
+            data["settings"]["vip_message"] = text
+            save_data(data)
+            await update.message.reply_text("✅ متن VIP بروزرسانی شد.", reply_markup=admin_keyboard())
+            return
+
+        if mode == "admin_edit_support_text":
+            clear_mode(context)
+            data["settings"]["support_prompt"] = text
+            save_data(data)
+            await update.message.reply_text("✅ متن پشتیبانی بروزرسانی شد.", reply_markup=admin_keyboard())
+            return
+
+        if mode == "admin_edit_buy_text":
+            clear_mode(context)
+            data["settings"]["buy_prompt"] = text
+            save_data(data)
+            await update.message.reply_text("✅ متن خرید بروزرسانی شد.", reply_markup=admin_keyboard())
+            return
+
+        if mode == "admin_quick_manage":
+            if text.startswith("+"):
+                data["quick_replies"].append(text[1:].strip())
+                save_data(data)
+                await update.message.reply_text("✅ افزوده شد.", reply_markup=exit_keyboard())
+            elif text.startswith("-"):
+                try:
+                    idx = int(text[1:].strip()) - 1
+                    removed = data["quick_replies"].pop(idx)
+                    save_data(data)
+                    await update.message.reply_text(f"✅ حذف شد: {removed}", reply_markup=exit_keyboard())
+                except Exception:
+                    await update.message.reply_text("❌ شماره نامعتبر.", reply_markup=exit_keyboard())
+            else:
+                await update.message.reply_text("از + برای افزودن و - برای حذف استفاده کنید.", reply_markup=exit_keyboard())
+            return
+
     # ============ DEFAULT ============
-    if is_admin(uid):
+    if admin:
         await update.message.reply_text("از دکمه‌های پنل استفاده کنید 👇", reply_markup=admin_keyboard())
     else:
         await update.message.reply_text("از دکمه‌های منو استفاده کنید 👇", reply_markup=main_keyboard())
 
 
-# ================= DAILY JOB: reminders & birthdays =================
+# ================= DAILY JOB =================
 async def daily_job(context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now().strftime("%m-%d")
     for uid_str, u in data["users"].items():
-        # birthday
         if u.get("birthday") == today:
             try:
-                await context.bot.send_message(
-                    int(uid_str),
-                    "🎂 تولدتون مبارک! 🎉\nبه افتخار شما یک کد تخفیف ویژه فعال شد: BDAY10"
-                )
+                await context.bot.send_message(int(uid_str), "🎂 تولدتون مبارک! 🎉\nکد تخفیف ویژه: BDAY10")
             except Exception:
                 pass
-        # inactivity (7+ days)
         try:
             last = datetime.strptime(u.get("last_active", now_str()), "%Y-%m-%d %H:%M")
             if datetime.now() - last > timedelta(days=7):
-                await context.bot.send_message(
-                    int(uid_str),
-                    "🥲 دلتنگتون بودیم! بیا ببین چه تخفیف‌های جدیدی منتظرته 🎁"
-                )
+                await context.bot.send_message(int(uid_str), "🥲 دلتنگتون بودیم! بیا ببین چه تخفیف‌های جدیدی منتظرته 🎁")
         except Exception:
             pass
 
