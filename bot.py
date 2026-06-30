@@ -5,13 +5,13 @@ import database
 import re
 from datetime import datetime
 
+
 # ---------------- MENU ----------------
 def menu(user_id):
     keyboard = [
-        ["🔎 استعلام شماره", "👤 جستجو"],
-        ["👤 پروفایل من", "🎁 دعوت دوستان"],
-        ["📦 بمبر", "💎 VIP"],
-        ["🆘 پشتیبانی"]
+        ["🔎 جستجو", "👤 پروفایل"],
+        ["🎁 دعوت دوستان", "💎 VIP"],
+        ["📦 بمبر", "🆘 پشتیبانی"]
     ]
 
     if user_id == ADMIN_ID:
@@ -24,68 +24,67 @@ def menu(user_id):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
-    database.cursor.execute(
-        "INSERT OR IGNORE INTO users (user_id, name) VALUES (?,?)",
-        (user.id, user.full_name)
-    )
+    database.cursor.execute("""
+    INSERT OR IGNORE INTO users (user_id, name, last_login)
+    VALUES (?,?,?)
+    """, (user.id, user.full_name, datetime.now().strftime("%Y-%m-%d %H:%M")))
+
     database.conn.commit()
 
     await update.message.reply_text(
-        "🛡 ربات مزاحم‌یاب PRO MAX فعال شد",
+        "🛡 ربات حرفه‌ای فعال شد",
         reply_markup=menu(user.id)
     )
 
 
-# ---------------- MAIN HANDLER ----------------
+# ---------------- HANDLER ----------------
 async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user = update.effective_user
     uid = user.id
 
-    # 🔎 SEARCH NUMBER
-    if re.fullmatch(r"09\d{9}", text):
+
+    # 🚫 BLOCK CHECK
+    database.cursor.execute("SELECT blocked FROM users WHERE user_id=?", (uid,))
+    b = database.cursor.fetchone()
+
+    if b and b[0] == 1:
+        await update.message.reply_text("⛔ شما مسدود شده‌اید")
+        return
+
+
+    # 🔎 SEARCH (NUMBER + NAME)
+    if len(text) > 2:
 
         database.cursor.execute(
             "INSERT INTO logs (user_id, query, time) VALUES (?,?,?)",
             (uid, text, datetime.now().strftime("%Y-%m-%d %H:%M"))
         )
 
-        database.cursor.execute(
-            "UPDATE users SET searches = searches + 1 WHERE user_id=?",
-            (uid,)
-        )
-
         database.conn.commit()
 
-        await update.message.reply_text("❌ نتیجه‌ای پیدا نشد")
+        await update.message.reply_text("🔎 در حال بررسی...")
 
-        await context.bot.send_message(
-            ADMIN_ID,
-            f"🔔 جستجو جدید\n👤 {user.full_name}\n📞 {text}"
-        )
         return
 
-    # ---------------- USER MENU ----------------
-    if text == "🔎 استعلام شماره":
-        await update.message.reply_text("📞 شماره را ارسال کنید")
+
+    # ---------------- MENU ----------------
+    if text == "🔎 جستجو":
+        await update.message.reply_text("📩 شماره یا اسم را ارسال کنید")
         return
 
-    if text == "👤 جستجو":
-        await update.message.reply_text("🔍 سیستم فعال است")
-        return
-
-    if text == "👤 پروفایل من":
+    if text == "👤 پروفایل":
 
         database.cursor.execute(
             "SELECT name, points, searches, vip FROM users WHERE user_id=?",
             (uid,)
         )
-        data = database.cursor.fetchone()
 
+        data = database.cursor.fetchone()
         name, points, searches, vip = data if data else (user.full_name, 0, 0, 0)
 
         await update.message.reply_text(
-            f"""👤 پروفایل PRO MAX
+            f"""👤 پروفایل
 
 🧾 نام: {name}
 ⭐ امتیاز: {points}
@@ -94,42 +93,55 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+
     if text == "🎁 دعوت دوستان":
-        link = f"https://t.me/yourbot?start={uid}"
+        bot_username = "YOUR_BOT_USERNAME"
+        link = f"https://t.me/{bot_username}?start={uid}"
+
         await update.message.reply_text(f"🔗 لینک دعوت:\n{link}")
         return
 
+
     if text == "💎 VIP":
-        await update.message.reply_text("💎 VIP در حال توسعه است")
+        await update.message.reply_text("📩 درخواست VIP ارسال شد")
+
+        await context.bot.send_message(
+            ADMIN_ID,
+            f"💎 درخواست VIP\n👤 {user.full_name}\n🆔 {uid}"
+        )
         return
+
 
     if text == "🆘 پشتیبانی":
         await update.message.reply_text("📩 پیام شما ثبت شد")
         return
 
+
     if text == "📦 بمبر":
-        await update.message.reply_text("⏳ در صف اجرا")
+        await update.message.reply_text("⏳ در حال پردازش")
         return
+
 
     # ---------------- ADMIN PANEL ----------------
     if text == "👑 پنل ادمین" and uid == ADMIN_ID:
 
         keyboard = [
-            ["📊 آمار سیستم", "👥 لیست کاربران"],
-            ["🔎 لاگ جستجو", "📣 پیام همگانی"],
-            ["🔙 خروج"]
+            ["📊 آمار", "👥 کاربران"],
+            ["🔎 لاگ‌ها", "🚫 بلاک کاربر"],
+            ["📣 پیام همگانی", "🔙 خروج"]
         ]
 
         await update.message.reply_text(
-            "👑 پنل PRO MAX فعال شد",
+            "👑 پنل ادمین فعال شد",
             reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         )
         return
 
+
     # ---------------- ADMIN FUNCTIONS ----------------
     if uid == ADMIN_ID:
 
-        if text == "📊 آمار سیستم":
+        if text == "📊 آمار":
             database.cursor.execute("SELECT COUNT(*) FROM users")
             users = database.cursor.fetchone()[0]
 
@@ -137,57 +149,80 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logs = database.cursor.fetchone()[0]
 
             await update.message.reply_text(
-                f"📊 آمار سیستم\n👥 کاربران: {users}\n🔎 جستجو: {logs}"
+                f"📊 آمار\n👥 کاربران: {users}\n🔎 جستجوها: {logs}"
             )
             return
 
-        if text == "👥 لیست کاربران":
-            database.cursor.execute("SELECT user_id, name FROM users LIMIT 10")
+
+        if text == "👥 کاربران":
+            database.cursor.execute("SELECT user_id, name, last_login FROM users LIMIT 10")
             rows = database.cursor.fetchall()
 
             msg = "👥 کاربران:\n\n"
+
             for r in rows:
-                msg += f"{r[0]} | {r[1]}\n"
+                msg += f"{r[0]} | {r[1]} | {r[2]}\n"
 
             await update.message.reply_text(msg)
             return
 
-        if text == "🔎 لاگ جستجو":
+
+        if text == "🔎 لاگ‌ها":
             database.cursor.execute("""
             SELECT user_id, query, time FROM logs ORDER BY id DESC LIMIT 10
             """)
             rows = database.cursor.fetchall()
 
-            msg = "🔎 لاگ سیستم:\n\n"
+            msg = "🔎 لاگ‌ها:\n\n"
+
             for r in rows:
                 msg += f"{r[0]} | {r[1]} | {r[2]}\n\n"
 
             await update.message.reply_text(msg)
             return
 
+
+        if text.startswith("🚫 بلاک"):
+            try:
+                target = int(text.split(" ")[1])
+
+                database.cursor.execute(
+                    "UPDATE users SET blocked=1 WHERE user_id=?",
+                    (target,)
+                )
+                database.conn.commit()
+
+                await update.message.reply_text("⛔ کاربر بلاک شد")
+            except:
+                await update.message.reply_text("❌ فرمت: 🚫 بلاک 123456")
+            return
+
+
         if text == "📣 پیام همگانی":
             await update.message.reply_text("✍ پیام را ارسال کنید")
             context.user_data["broadcast"] = True
             return
+
 
         if context.user_data.get("broadcast") and uid == ADMIN_ID:
 
             database.cursor.execute("SELECT user_id FROM users")
             users = database.cursor.fetchall()
 
-            success = 0
+            sent = 0
 
             for u in users:
                 try:
                     await context.bot.send_message(u[0], text)
-                    success += 1
+                    sent += 1
                 except:
                     pass
 
             context.user_data["broadcast"] = False
 
-            await update.message.reply_text(f"📣 ارسال شد به {success} کاربر")
+            await update.message.reply_text(f"📣 ارسال شد به {sent} کاربر")
             return
+
 
         if text == "🔙 خروج":
             await update.message.reply_text(
@@ -195,6 +230,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=menu(uid)
             )
             return
+
 
     await update.message.reply_text("❌ دستور نامعتبر")
 
